@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Katsu Tabi — Kitchen Timers</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="header">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <div>
+          <h1 class="brand-title">Katsu Tabi</h1>
+          <p class="brand-tag">Kitchen timers</p>
+        </div>
+      </div>
+    </header>
+
+    <nav class="tab-bar" role="tablist" aria-label="Workspaces">
+      <div class="tab-list" id="tab-list"></div>
+      <button type="button" class="btn btn-tab-add" id="btn-add-tab" title="New workspace">+ Workspace</button>
+    </nav>
+
+    <main class="main" id="workspace">
+      <section class="panel panel-add">
+        <h2 class="panel-title">New timer</h2>
+        <p class="panel-hint">Tap one or more dishes that share the same cook time (checkboxes), then quantity (1–10). They run as one timer, named like “Dish A + Dish B”. The countdown starts automatically.</p>
+        <form class="add-form" id="add-form">
+          <div class="field-group">
+            <span class="qty-label" id="dish-label">Dish</span>
+            <div
+              class="dish-picker"
+              id="dish-picker"
+              role="group"
+              aria-labelledby="dish-label"
+            ></div>
+          </div>
+          <div class="field-group">
+            <span class="qty-label" id="quantity-label">Quantity</span>
+            <div
+              class="quantity-picker"
+              id="quantity-picker"
+              role="radiogroup"
+              aria-labelledby="quantity-label"
+            ></div>
+          </div>
+          <p class="form-error" id="add-form-error" hidden></p>
+        </form>
+      </section>
+
+      <section class="panel">
+        <h2 class="panel-title">Active timers</h2>
+        <p class="panel-hint empty-hint" id="timers-empty">No active timers. Newest timers appear on top.</p>
+        <ul class="timer-list" id="timer-list" aria-live="polite"></ul>
+      </section>
+
+      <section class="panel panel-finished">
+        <h2 class="panel-title">Just finished</h2>
+        <p class="panel-hint">Items clear automatically after 6 minutes. You can always start another timer for the same dish anytime.</p>
+        <ul class="timer-list" id="finished-list"></ul>
+      </section>
+    </main>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>
