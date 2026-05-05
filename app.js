@@ -84,11 +84,16 @@
   let sharedAudioCtx = null;
   /** Master gain for the current alarm; silenced by stopAlertSound (e.g. DONE). */
   let alertOutputGain = null;
+  /** HTML5 alarm: Mobile Safari often blocks Web Audio until unlock; WAV + audio element plays after priming. */
+  let alarmAudioPrimed = false;
+  let alarmFullWavUrl = null;
+  let alarmAudioEl = null;
   /** Dish keys selected for the next timer (same cook time only), in tap order. */
   let selectedDishKeyOrder = [];
   let audioUnlockBound = false;
 
   function unlockAudio() {
+    primeHtml5Alarm();
     try {
       const Ctx = window.AudioContext || window.webkitAudioContext;
       if (!Ctx) return;
@@ -116,13 +121,144 @@
   function bindAudioUnlockOnFirstGesture() {
     if (audioUnlockBound) return;
     audioUnlockBound = true;
-    const onFirst = () => {
+    const onUnlock = () => {
       unlockAudio();
-      document.removeEventListener("pointerdown", onFirst, true);
-      document.removeEventListener("touchstart", onFirst, true);
     };
-    document.addEventListener("pointerdown", onFirst, true);
-    document.addEventListener("touchstart", onFirst, true);
+    document.addEventListener("pointerdown", onUnlock, true);
+    document.addEventListener("touchstart", onUnlock, true);
+    document.addEventListener("click", onUnlock, true);
+  }
+
+  function setAscii(view, offset, str) {
+    for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+  }
+
+  /** Pre-rendered twin-bell pattern (~same timing as Web Audio alarm) as 16-bit mono WAV bytes. */
+  function buildAlarmWavBytes() {
+    const sampleRate = 22050;
+    const bell1 = 1046;
+    const bell2 = 1320;
+    const strikeInterval = 0.068;
+    const ringDecay = 0.088;
+    const totalTime = 2.45;
+    const gapBetweenAlarms = 0.38;
+    const numStrikes = Math.floor(totalTime / strikeInterval);
+    const durationSec = 2 * totalTime + gapBetweenAlarms;
+    const numSamples = Math.ceil(sampleRate * durationSec);
+    const pcm = new Float32Array(numSamples);
+
+    function strikeAt(strikeT, freq) {
+      const i0 = Math.max(0, Math.floor(strikeT * sampleRate));
+      const i1 = Math.min(numSamples, Math.ceil((strikeT + ringDecay + 0.02) * sampleRate));
+      for (let i = i0; i < i1; i++) {
+        const t = i / sampleRate;
+        const dt = t - strikeT;
+        if (dt < 0 || dt >= ringDecay) continue;
+        const env = Math.exp(-dt * 22);
+        let s = 0.42 * Math.sin(2 * Math.PI * freq * t);
+        s += 0.14 * Math.sin(2 * Math.PI * freq * 2.8 * t);
+        pcm[i] += env * s;
+      }
+    }
+
+    for (let round = 0; round < 2; round++) {
+      const tBase = round * (totalTime + gapBetweenAlarms);
+      for (let n = 0; n < numStrikes; n++) {
+        const strikeT = tBase + n * strikeInterval;
+        const baseFreq = n % 2 === 0 ? bell1 : bell2;
+        const wobble = 1 + (n % 5) * 0.003;
+        strikeAt(strikeT, baseFreq * wobble);
+      }
+    }
+
+    let peak = 0.0001;
+    for (let i = 0; i < numSamples; i++) peak = Math.max(peak, Math.abs(pcm[i]));
+    const norm = 0.98 / peak;
+
+    const dataSize = numSamples * 2;
+    const buffer = new ArrayBuffer(44 + dataSize);
+    const view = new DataView(buffer);
+    setAscii(view, 0, "RIFF");
+    view.setUint32(4, 36 + dataSize, true);
+    setAscii(view, 8, "WAVE");
+    setAscii(view, 12, "fmt ");
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    setAscii(view, 36, "data");
+    view.setUint32(40, dataSize, true);
+    let off = 44;
+    for (let i = 0; i < numSamples; i++) {
+      const x = Math.max(-1, Math.min(1, pcm[i] * norm));
+      view.setInt16(off, Math.round(x * 32767), true);
+      off += 2;
+    }
+    return new Uint8Array(buffer);
+  }
+
+  function getAlarmFullWavUrl() {
+    if (!alarmFullWavUrl) {
+      alarmFullWavUrl = URL.createObjectURL(new Blob([buildAlarmWavBytes()], { type: "audio/wav" }));
+    }
+    return alarmFullWavUrl;
+  }
+
+  function ensureAlarmAudioElement() {
+    if (alarmAudioEl) return alarmAudioEl;
+    const el = document.createElement("audio");
+    el.preload = "auto";
+    el.setAttribute("playsinline", "");
+    el.setAttribute("webkit-playsinline", "");
+    el.src = getAlarmFullWavUrl();
+    el.style.display = "none";
+    document.body.appendChild(el);
+    alarmAudioEl = el;
+    return el;
+  }
+
+  function whenAlarmAudioReady(el) {
+    if (el.readyState >= 2) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      el.addEventListener("canplay", () => resolve(), { once: true });
+      el.addEventListener("error", () => reject(new Error("alarm-audio-load")), { once: true });
+    });
+  }
+
+  /** Inaudible / low-gain play so Mobile Safari allows later .play() when the timer fires. */
+  function primeHtml5Alarm() {
+    if (alarmAudioPrimed) return;
+    void (async () => {
+      try {
+        const el = ensureAlarmAudioElement();
+        if (!el.src) el.src = getAlarmFullWavUrl();
+        await whenAlarmAudioReady(el);
+        el.pause();
+        el.currentTime = 0;
+        const prevVol = el.volume;
+        el.volume = 0.02;
+        await el.play();
+        el.pause();
+        el.currentTime = 0;
+        el.volume = prevVol > 0 ? prevVol : 1;
+        alarmAudioPrimed = true;
+      } catch {
+        /* Next tap / timer end will retry or use Web Audio. */
+      }
+    })();
+  }
+
+  function tryVibrateAlarm() {
+    try {
+      if (typeof navigator !== "undefined" && navigator.vibrate) {
+        navigator.vibrate([180, 100, 180, 100, 280]);
+      }
+    } catch {
+      /* ignore */
+    }
   }
 
   function activeTab() {
@@ -142,6 +278,14 @@
 
   function stopAlertSound() {
     try {
+      if (alarmAudioEl) {
+        alarmAudioEl.pause();
+        alarmAudioEl.currentTime = 0;
+      }
+    } catch {
+      /* ignore */
+    }
+    try {
       if (!sharedAudioCtx || !alertOutputGain) return;
       const ctx = sharedAudioCtx;
       const now = ctx.currentTime;
@@ -154,84 +298,99 @@
     }
   }
 
+  async function playWebAudioAlarm() {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return;
+    if (!sharedAudioCtx) sharedAudioCtx = new Ctx();
+    const ctx = sharedAudioCtx;
+    if (ctx.state === "suspended") {
+      try {
+        await ctx.resume();
+      } catch {
+        return;
+      }
+    }
+    if (ctx.state !== "running") return;
+    const t0 = ctx.currentTime;
+    const master = ctx.createGain();
+    master.gain.setValueAtTime(0.52, t0);
+    master.connect(ctx.destination);
+    alertOutputGain = master;
+
+    /* Twin-bell mechanical alarm: hammer alternates between two metal tones. */
+    const bell1 = 1046;
+    const bell2 = 1320;
+    const strikeInterval = 0.068;
+    const ringDecay = 0.088;
+    const totalTime = 2.45;
+    const numStrikes = Math.floor(totalTime / strikeInterval);
+    const gapBetweenAlarms = 0.38;
+
+    for (let round = 0; round < 2; round++) {
+      const tBase = t0 + round * (totalTime + gapBetweenAlarms);
+
+      for (let n = 0; n < numStrikes; n++) {
+        const strikeT = tBase + n * strikeInterval;
+        const baseFreq = n % 2 === 0 ? bell1 : bell2;
+        const wobble = 1 + (n % 5) * 0.003;
+        const freq = baseFreq * wobble;
+
+        const tri = ctx.createOscillator();
+        const triG = ctx.createGain();
+        tri.type = "triangle";
+        tri.frequency.setValueAtTime(freq, strikeT);
+        triG.gain.setValueAtTime(0.0008, strikeT);
+        triG.gain.exponentialRampToValueAtTime(0.26, strikeT + 0.002);
+        triG.gain.exponentialRampToValueAtTime(0.0008, strikeT + ringDecay);
+        tri.connect(triG);
+        triG.connect(master);
+        tri.start(strikeT);
+        tri.stop(strikeT + ringDecay + 0.015);
+
+        const harm = ctx.createOscillator();
+        const harmG = ctx.createGain();
+        harm.type = "sine";
+        harm.frequency.setValueAtTime(freq * 2.8, strikeT);
+        harmG.gain.setValueAtTime(0.0008, strikeT);
+        harmG.gain.exponentialRampToValueAtTime(0.09, strikeT + 0.002);
+        harmG.gain.exponentialRampToValueAtTime(0.0008, strikeT + ringDecay * 0.85);
+        harm.connect(harmG);
+        harmG.connect(master);
+        harm.start(strikeT);
+        harm.stop(strikeT + ringDecay + 0.015);
+      }
+
+      /* Quiet motor / spring undertone */
+      const buzz = ctx.createOscillator();
+      const buzzG = ctx.createGain();
+      buzz.type = "square";
+      buzz.frequency.setValueAtTime(118, tBase);
+      buzzG.gain.setValueAtTime(0.0008, tBase);
+      buzzG.gain.exponentialRampToValueAtTime(0.045, tBase + 0.08);
+      buzzG.gain.setValueAtTime(0.045, tBase + totalTime - 0.12);
+      buzzG.gain.exponentialRampToValueAtTime(0.0008, tBase + totalTime);
+      buzz.connect(buzzG);
+      buzzG.connect(master);
+      buzz.start(tBase);
+      buzz.stop(tBase + totalTime + 0.04);
+    }
+  }
+
   async function playAlertSound() {
+    stopAlertSound();
+    tryVibrateAlarm();
     try {
-      const Ctx = window.AudioContext || window.webkitAudioContext;
-      if (!Ctx) return;
-      stopAlertSound();
-      if (!sharedAudioCtx) sharedAudioCtx = new Ctx();
-      const ctx = sharedAudioCtx;
-      if (ctx.state === "suspended") {
-        try {
-          await ctx.resume();
-        } catch {
-          return;
-        }
-      }
-      if (ctx.state !== "running") return;
-      const t0 = ctx.currentTime;
-      const master = ctx.createGain();
-      master.gain.setValueAtTime(0.52, t0);
-      master.connect(ctx.destination);
-      alertOutputGain = master;
-
-      /* Twin-bell mechanical alarm: hammer alternates between two metal tones. */
-      const bell1 = 1046;
-      const bell2 = 1320;
-      const strikeInterval = 0.068;
-      const ringDecay = 0.088;
-      const totalTime = 2.45;
-      const numStrikes = Math.floor(totalTime / strikeInterval);
-      const gapBetweenAlarms = 0.38;
-
-      for (let round = 0; round < 2; round++) {
-        const tBase = t0 + round * (totalTime + gapBetweenAlarms);
-
-        for (let n = 0; n < numStrikes; n++) {
-          const strikeT = tBase + n * strikeInterval;
-          const baseFreq = n % 2 === 0 ? bell1 : bell2;
-          const wobble = 1 + (n % 5) * 0.003;
-          const freq = baseFreq * wobble;
-
-          const tri = ctx.createOscillator();
-          const triG = ctx.createGain();
-          tri.type = "triangle";
-          tri.frequency.setValueAtTime(freq, strikeT);
-          triG.gain.setValueAtTime(0.0008, strikeT);
-          triG.gain.exponentialRampToValueAtTime(0.26, strikeT + 0.002);
-          triG.gain.exponentialRampToValueAtTime(0.0008, strikeT + ringDecay);
-          tri.connect(triG);
-          triG.connect(master);
-          tri.start(strikeT);
-          tri.stop(strikeT + ringDecay + 0.015);
-
-          const harm = ctx.createOscillator();
-          const harmG = ctx.createGain();
-          harm.type = "sine";
-          harm.frequency.setValueAtTime(freq * 2.8, strikeT);
-          harmG.gain.setValueAtTime(0.0008, strikeT);
-          harmG.gain.exponentialRampToValueAtTime(0.09, strikeT + 0.002);
-          harmG.gain.exponentialRampToValueAtTime(0.0008, strikeT + ringDecay * 0.85);
-          harm.connect(harmG);
-          harmG.connect(master);
-          harm.start(strikeT);
-          harm.stop(strikeT + ringDecay + 0.015);
-        }
-
-        /* Quiet motor / spring undertone */
-        const buzz = ctx.createOscillator();
-        const buzzG = ctx.createGain();
-        buzz.type = "square";
-        buzz.frequency.setValueAtTime(118, tBase);
-        buzzG.gain.setValueAtTime(0.0008, tBase);
-        buzzG.gain.exponentialRampToValueAtTime(0.045, tBase + 0.08);
-        buzzG.gain.setValueAtTime(0.045, tBase + totalTime - 0.12);
-        buzzG.gain.exponentialRampToValueAtTime(0.0008, tBase + totalTime);
-        buzz.connect(buzzG);
-        buzzG.connect(master);
-        buzz.start(tBase);
-        buzz.stop(tBase + totalTime + 0.04);
-      }
+      const el = ensureAlarmAudioElement();
+      await whenAlarmAudioReady(el);
+      el.pause();
+      el.currentTime = 0;
+      await el.play();
+      return;
+    } catch {
+      /* Often happens if HTML5 audio was never primed by a user gesture. */
+    }
+    try {
+      await playWebAudioAlarm();
     } catch {
       /* ignore */
     }
