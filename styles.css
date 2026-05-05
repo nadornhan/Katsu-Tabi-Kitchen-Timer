@@ -576,6 +576,42 @@ body {
 }
 
 @media (max-width: 520px) {
+  .app {
+    padding: 1.35rem 0.85rem 3rem;
+  }
+
+  .panel {
+    padding: 1rem 1rem;
+  }
+
+  .panel-hint {
+    margin-bottom: 0.75rem;
+    font-size: 0.78rem;
+    line-height: 1.35;
+  }
+
+  .add-form {
+    gap: 0.85rem;
+  }
+
+  /* Dense dish chips: multi-column grid instead of stacked full-width rows */
+  .dish-picker {
+    gap: 0.65rem;
+  }
+
+  .dish-category-title {
+    font-size: 0.6rem;
+    margin: 0 0 0.35rem;
+    padding-bottom: 0.2rem;
+    letter-spacing: 0.07em;
+  }
+
+  .dish-category-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(5.15rem, 1fr));
+    gap: 0.28rem;
+  }
+
   .brand-title {
     font-size: 1.85rem;
   }
@@ -629,9 +665,20 @@ body {
   }
 
   .dish-btn {
-    font-size: 1.12rem;
-    min-height: 3.1rem;
-    padding: 0.6rem 0.85rem;
+    flex: unset;
+    width: 100%;
+    min-width: 0;
+    min-height: 2.45rem;
+    padding: 0.32rem 0.4rem;
+    font-family: var(--font);
+    font-size: 0.72rem;
+    font-weight: 600;
+    line-height: 1.2;
+    text-align: center;
+    letter-spacing: 0;
+    word-break: break-word;
+    hyphens: auto;
+    -webkit-hyphens: auto;
   }
 
   .timer-dish {
