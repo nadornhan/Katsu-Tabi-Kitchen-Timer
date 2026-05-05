@@ -456,6 +456,11 @@ body {
   border-color: #94a3b8;
 }
 
+.timer-card--resting {
+  border-color: var(--yellow);
+  box-shadow: 0 0 0 1px var(--yellow-soft);
+}
+
 .timer-top {
   display: flex;
   justify-content: space-between;
@@ -481,6 +486,14 @@ body {
   margin: 0.3rem 0 0;
   font-size: 0.8125rem;
   color: var(--text-muted);
+}
+
+.timer-rest-note {
+  margin: 0.35rem 0 0;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  color: var(--accent);
+  line-height: 1.35;
 }
 
 .timer-remaining {
@@ -526,6 +539,11 @@ body {
 .finished-card {
   border-style: dashed;
   opacity: 0.95;
+}
+
+.finished-card--done-highlight {
+  box-shadow: 0 0 0 2px var(--danger), var(--shadow);
+  border-color: rgba(185, 28, 28, 0.45);
 }
 
 .finished-top {
