@@ -86,6 +86,44 @@
   let alertOutputGain = null;
   /** Dish keys selected for the next timer (same cook time only), in tap order. */
   let selectedDishKeyOrder = [];
+  let audioUnlockBound = false;
+
+  function unlockAudio() {
+    try {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return;
+      if (!sharedAudioCtx) sharedAudioCtx = new Ctx();
+      const ctx = sharedAudioCtx;
+      const p = ctx.state === "suspended" ? ctx.resume() : Promise.resolve();
+      p
+        .then(() => {
+          /* Inaudible priming pass — helps Mobile Safari treat the context as user-started. */
+          const osc = ctx.createOscillator();
+          const g = ctx.createGain();
+          g.gain.value = 0;
+          osc.connect(g);
+          g.connect(ctx.destination);
+          const t = ctx.currentTime;
+          osc.start(t);
+          osc.stop(t + 0.001);
+        })
+        .catch(() => {});
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function bindAudioUnlockOnFirstGesture() {
+    if (audioUnlockBound) return;
+    audioUnlockBound = true;
+    const onFirst = () => {
+      unlockAudio();
+      document.removeEventListener("pointerdown", onFirst, true);
+      document.removeEventListener("touchstart", onFirst, true);
+    };
+    document.addEventListener("pointerdown", onFirst, true);
+    document.addEventListener("touchstart", onFirst, true);
+  }
 
   function activeTab() {
     return state.tabs.find((t) => t.id === state.activeTabId);
@@ -116,14 +154,21 @@
     }
   }
 
-  function playAlertSound() {
+  async function playAlertSound() {
     try {
       const Ctx = window.AudioContext || window.webkitAudioContext;
       if (!Ctx) return;
       stopAlertSound();
       if (!sharedAudioCtx) sharedAudioCtx = new Ctx();
       const ctx = sharedAudioCtx;
-      if (ctx.state === "suspended") ctx.resume();
+      if (ctx.state === "suspended") {
+        try {
+          await ctx.resume();
+        } catch {
+          return;
+        }
+      }
+      if (ctx.state !== "running") return;
       const t0 = ctx.currentTime;
       const master = ctx.createGain();
       master.gain.setValueAtTime(0.52, t0);
@@ -816,7 +861,16 @@
   });
 
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible") renderWorkspace();
+    if (document.visibilityState === "visible") {
+      try {
+        if (sharedAudioCtx && sharedAudioCtx.state === "suspended") {
+          sharedAudioCtx.resume().catch(() => {});
+        }
+      } catch {
+        /* ignore */
+      }
+      renderWorkspace();
+    }
   });
 
   window.addEventListener("storage", (e) => {
@@ -828,6 +882,7 @@
   });
 
   initForm();
+  bindAudioUnlockOnFirstGesture();
   renderWorkspace();
   startTicking();
 })();
