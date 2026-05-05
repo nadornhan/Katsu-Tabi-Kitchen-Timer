@@ -3,6 +3,10 @@
 
   const STORAGE_KEY = "katsu-tabi-kitchen-v1";
   const FINISHED_RETURN_MS = 6 * 60 * 1000;
+  /** Red border on just-finished cards after DONE (from when they land in the list). */
+  const DONE_HIGHLIGHT_MS = 2 * 60 * 1000;
+  const PORK_REST_DISH_KEYS = new Set(["pork-katsu-thick", "pork-katsu-thin"]);
+  const PORK_REST_AFTER_DONE_SEC = 60;
 
   const MAX_QTY = 10;
 
@@ -69,6 +73,15 @@
   function migrate(s) {
     s.tabs.forEach((tab) => {
       tab.timers = tab.timers || [];
+      tab.timers.forEach((t) => {
+        if (t.state === "resting" || t.state === "rest_done") return;
+        if (t.state !== "running" && t.state !== "paused" && t.state !== "done") {
+          t.state = "paused";
+          if (t.pausedRemainingMs == null && t.durationSec != null) {
+            t.pausedRemainingMs = t.durationSec * 1000;
+          }
+        }
+      });
       tab.justFinished = (tab.justFinished || []).map((item) => ({
         ...item,
         movedAt: item.movedAt || Date.now(),
@@ -407,6 +420,33 @@
     return p ? p.label : "";
   }
 
+  function timerNeedsPorkRest(t) {
+    if (Array.isArray(t.presetKeys) && t.presetKeys.length === 1) {
+      return PORK_REST_DISH_KEYS.has(t.presetKeys[0]);
+    }
+    const name = (t.dishName || "").trim().toLowerCase();
+    return (
+      name === String(DISH_PRESETS["pork-katsu-thick"].label).toLowerCase() ||
+      name === String(DISH_PRESETS["pork-katsu-thin"].label).toLowerCase()
+    );
+  }
+
+  function moveTimerToJustFinished(tab, t) {
+    stopAlertSound();
+    tab.timers = tab.timers.filter((x) => x.id !== t.id);
+    tab.justFinished.push({
+      id: uuid(),
+      dishName: t.dishName,
+      quantity: t.quantity,
+      durationSec: t.durationSec,
+      movedAt: Date.now(),
+    });
+    soundPlayedFor.delete(t.id);
+    soundPlayedFor.delete(`${t.id}:rest`);
+    persist();
+    renderWorkspace();
+  }
+
   function syncDishButtonAria() {
     const sel = new Set(selectedDishKeyOrder);
     document.querySelectorAll("#dish-picker .dish-btn").forEach((btn) => {
@@ -556,18 +596,32 @@
 
   /** Remaining time (ms); paused uses frozen value captured at Stop for exact resume. */
   function timerRemainingMs(t) {
-    if (t.state === "done") return 0;
+    if (t.state === "done" || t.state === "rest_done") return 0;
     if (t.state === "paused") {
       if (t.pausedRemainingMs != null) return Math.max(0, t.pausedRemainingMs);
       return Math.max(0, (t.pausedRemainingSec ?? 0) * 1000);
     }
-    if (t.state === "running" && t.endAt) return Math.max(0, t.endAt - Date.now());
+    if ((t.state === "running" || t.state === "resting") && t.endAt) {
+      return Math.max(0, t.endAt - Date.now());
+    }
     return (t.durationSec ?? 0) * 1000;
   }
 
   /** Whole seconds for display (ceiling so 0.3s left shows as 1s until it hits zero). */
   function timerRemainingSec(t) {
     return Math.ceil(timerRemainingMs(t) / 1000);
+  }
+
+  function tryCompleteRestTimer(t) {
+    if (t.state !== "resting") return;
+    if (timerRemainingMs(t) > 0) return;
+    t.state = "rest_done";
+    t.endAt = null;
+    if (!soundPlayedFor.has(`${t.id}:rest`)) {
+      soundPlayedFor.add(`${t.id}:rest`);
+      playAlertSound();
+    }
+    persist();
   }
 
   function tryCompleteTimer(t) {
@@ -593,7 +647,7 @@
     persist();
   }
 
-  function addTimer(dishName, quantity, durationSec) {
+  function addTimer(dishName, quantity, durationSec, presetKeys) {
     const tab = activeTab();
     if (!dishName) {
       showAddError("Select one or more dishes with the same cook time.");
@@ -609,6 +663,7 @@
       pausedRemainingMs: null,
       pausedRemainingSec: null,
       createdAt: Date.now(),
+      presetKeys: Array.isArray(presetKeys) && presetKeys.length ? presetKeys.slice() : null,
     };
     tab.timers.push(t);
     soundPlayedFor.delete(t.id);
@@ -639,7 +694,7 @@
 
     const dishName = keys.map((k) => dishLabelFromKey(k)).join(" + ");
     showAddError("");
-    if (addTimer(dishName, quantity, durationSec)) {
+    if (addTimer(dishName, quantity, durationSec, keys)) {
       clearQuantitySelection();
       clearDishSelection();
     }
@@ -723,8 +778,12 @@
       if (t.state === "running") li.classList.add("timer-card--running");
       else if (t.state === "done") li.classList.add("timer-card--done");
       else if (t.state === "paused") li.classList.add("timer-card--paused");
+      else if (t.state === "resting") li.classList.add("timer-card--resting");
+      else if (t.state === "rest_done") li.classList.add("timer-card--done");
 
-      if (t.state === "done") {
+      const doneLike = t.state === "done" || t.state === "rest_done";
+
+      if (doneLike) {
         li.innerHTML = `
         <div class="timer-top timer-top--done">
           <div>
@@ -744,6 +803,7 @@
           <div>
             <p class="timer-dish"></p>
             <p class="timer-meta"></p>
+            <p class="timer-rest-note" hidden></p>
           </div>
           <div class="timer-remaining" aria-label="Time left"></div>
         </div>
@@ -753,8 +813,21 @@
 
       $(".timer-dish", li).textContent = t.dishName;
       $(".timer-meta", li).textContent = `Qty ${t.quantity} · ${formatTime(t.durationSec)} total`;
-      $(".timer-remaining", li).textContent =
-        t.state === "done" ? "Done" : formatTime(remaining);
+
+      const restNote = li.querySelector(".timer-rest-note");
+      if (restNote) {
+        if (t.state === "resting") {
+          restNote.hidden = false;
+          restNote.textContent = "Pork is resting";
+        } else {
+          restNote.hidden = true;
+          restNote.textContent = "";
+        }
+      }
+
+      const remText =
+        t.state === "done" || t.state === "rest_done" ? "Done" : formatTime(remaining);
+      $(".timer-remaining", li).textContent = remText;
 
       const actions = $(".timer-actions", li);
 
@@ -781,6 +854,7 @@
         resume.addEventListener("click", () => {
           startTimerObject(t);
           soundPlayedFor.delete(t.id);
+          soundPlayedFor.delete(`${t.id}:rest`);
           renderWorkspace();
         });
         actions.append(resume);
@@ -793,25 +867,29 @@
       cancel.addEventListener("click", () => {
         tab.timers = tab.timers.filter((x) => x.id !== t.id);
         soundPlayedFor.delete(t.id);
+        soundPlayedFor.delete(`${t.id}:rest`);
         persist();
         renderWorkspace();
       });
       actions.append(cancel);
 
-      const reset = document.createElement("button");
-      reset.type = "button";
-      reset.className = "btn btn-small btn-ghost";
-      reset.textContent = "Reset";
-      reset.addEventListener("click", () => {
-        t.state = "paused";
-        t.pausedRemainingMs = t.durationSec * 1000;
-        t.pausedRemainingSec = null;
-        t.endAt = null;
-        soundPlayedFor.delete(t.id);
-        persist();
-        renderWorkspace();
-      });
-      actions.append(reset);
+      if (t.state !== "resting") {
+        const reset = document.createElement("button");
+        reset.type = "button";
+        reset.className = "btn btn-small btn-ghost";
+        reset.textContent = "Reset";
+        reset.addEventListener("click", () => {
+          t.state = "paused";
+          t.pausedRemainingMs = t.durationSec * 1000;
+          t.pausedRemainingSec = null;
+          t.endAt = null;
+          soundPlayedFor.delete(t.id);
+          soundPlayedFor.delete(`${t.id}:rest`);
+          persist();
+          renderWorkspace();
+        });
+        actions.append(reset);
+      }
 
       if (t.state === "done") {
         const move = document.createElement("button");
@@ -820,18 +898,26 @@
         move.textContent = "DONE";
         move.setAttribute("aria-label", "Done — move to just finished section");
         move.addEventListener("click", () => {
-          stopAlertSound();
-          tab.timers = tab.timers.filter((x) => x.id !== t.id);
-          tab.justFinished.push({
-            id: uuid(),
-            dishName: t.dishName,
-            quantity: t.quantity,
-            durationSec: t.durationSec,
-            movedAt: Date.now(),
-          });
-          soundPlayedFor.delete(t.id);
-          persist();
-          renderWorkspace();
+          if (timerNeedsPorkRest(t)) {
+            stopAlertSound();
+            t.state = "resting";
+            t.endAt = Date.now() + PORK_REST_AFTER_DONE_SEC * 1000;
+            soundPlayedFor.delete(`${t.id}:rest`);
+            persist();
+            renderWorkspace();
+            return;
+          }
+          moveTimerToJustFinished(tab, t);
+        });
+        $(".timer-done-slot", li).append(move);
+      } else if (t.state === "rest_done") {
+        const move = document.createElement("button");
+        move.type = "button";
+        move.className = "btn btn-primary btn-done";
+        move.textContent = "DONE";
+        move.setAttribute("aria-label", "Done — move to just finished section");
+        move.addEventListener("click", () => {
+          moveTimerToJustFinished(tab, t);
         });
         $(".timer-done-slot", li).append(move);
       }
@@ -857,6 +943,9 @@
       const li = document.createElement("li");
       li.setAttribute("data-finished-id", item.id);
       li.className = "timer-card finished-card";
+      if (now - (item.movedAt || 0) < DONE_HIGHLIGHT_MS) {
+        li.classList.add("finished-card--done-highlight");
+      }
       li.innerHTML = `
         <div class="timer-top finished-top">
           <div class="finished-info">
@@ -924,11 +1013,26 @@
       if (!li) return false;
       const remEl = li.querySelector(".timer-remaining");
       if (!remEl) return false;
-      remEl.textContent = t.state === "done" ? "Done" : formatTime(timerRemainingSec(t));
+      const remText =
+        t.state === "done" || t.state === "rest_done" ? "Done" : formatTime(timerRemainingSec(t));
+      remEl.textContent = remText;
+
+      const restNote = li.querySelector(".timer-rest-note");
+      if (t.state === "resting") {
+        if (!restNote) return false;
+        restNote.hidden = false;
+        restNote.textContent = "Pork is resting";
+      } else if (restNote) {
+        restNote.hidden = true;
+        restNote.textContent = "";
+      }
+
       li.className = "timer-card";
       if (t.state === "running") li.classList.add("timer-card--running");
       else if (t.state === "done") li.classList.add("timer-card--done");
       else if (t.state === "paused") li.classList.add("timer-card--paused");
+      else if (t.state === "resting") li.classList.add("timer-card--resting");
+      else if (t.state === "rest_done") li.classList.add("timer-card--done");
     }
 
     return true;
@@ -957,6 +1061,8 @@
       if (!cd) return false;
       const left = Math.max(0, FINISHED_RETURN_MS - (now - (item.movedAt || 0)));
       cd.textContent = `Returns in ${Math.ceil(left / 1000)}s`;
+      const hl = now - (item.movedAt || 0) < DONE_HIGHLIGHT_MS;
+      li.classList.toggle("finished-card--done-highlight", hl);
     }
 
     return true;
@@ -976,6 +1082,9 @@
       if (t.state === "running") {
         tryCompleteTimer(t);
         if (t.state === "done") needFullRender = true;
+      } else if (t.state === "resting") {
+        tryCompleteRestTimer(t);
+        if (t.state === "rest_done") needFullRender = true;
       }
     });
 
