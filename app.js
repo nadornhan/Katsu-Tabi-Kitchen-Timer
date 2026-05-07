@@ -8,9 +8,9 @@
   const PORK_REST_DISH_KEYS = new Set(["pork-katsu-thick", "pork-katsu-thin"]);
   const PORK_REST_AFTER_DONE_SEC = 60;
 
-  const MAX_QTY = 10;
+  const MAX_QTY = 5;
 
-  /** One fixed cook duration per dish (seconds), same for every quantity 1–10. */
+  /** One fixed cook duration per dish (seconds), same for every quantity 1–5. */
   const DISH_PRESETS = {
     "brussels-sprouts": { label: "Brussels Sprouts", durationSec: 3 * 60 },
     "agedashi-tofu": { label: "Agedashi Tofu", durationSec: 3 * 60 },
@@ -27,12 +27,17 @@
     "salmon-teriyaki": { label: "Salmon Teriyaki", durationSec: 1 * 60 },
     "saba-teriyaki": { label: "Saba Teriyaki", durationSec: 3 * 60 },
     "tofu-ochazuke": { label: "Tofu Ochazuke", durationSec: 5 * 60 },
+    unagi: { label: "Unagi", durationSec: 3 * 60 },
+    "saba-shio": { label: "Saba Shio", durationSec: 8 * 60 },
+    alfonsino: { label: "Alfonsino", durationSec: 8 * 60 },
+    "salmon-ochazuke": { label: "Salmon Ochazuke", durationSec: 3 * 60 },
   };
 
   /** Category sections: keys listed in display order; unlisted keys go under "Other". */
   const DISH_CATEGORY_CHICKEN = ["karaage", "chicken-katsu", "chicken-nanban"];
   const DISH_CATEGORY_PORK = ["pork-katsu-thick", "pork-katsu-thin"];
   const DISH_CATEGORY_TERIYAKI = ["chicken-teriyaki", "salmon-teriyaki", "saba-teriyaki"];
+  const DISH_CATEGORY_FISH = ["unagi", "saba-shio", "alfonsino", "salmon-ochazuke"];
 
   const $ = (sel, el = document) => el.querySelector(sel);
 
@@ -94,59 +99,33 @@
   let state = getState();
   let tickHandle = null;
   let soundPlayedFor = new Set();
-  let sharedAudioCtx = null;
-  /** Master gain for the current alarm; silenced by stopAlertSound (e.g. DONE). */
-  let alertOutputGain = null;
-  /** HTML5 alarm: Mobile Safari often blocks Web Audio until unlock; WAV + audio element plays after priming. */
-  let alarmAudioPrimed = false;
-  let alarmFullWavUrl = null;
-  let alarmAudioEl = null;
   /** Dish keys selected for the next timer (same cook time only), in tap order. */
   let selectedDishKeyOrder = [];
   let audioUnlockBound = false;
+  let sharedAudioCtx = null;
+  /** Master gain for the mechanical alarm; silenced by stopAlertSound. */
+  let alertOutputGain = null;
+  let alarmAudioPrimed = false;
+  let alarmFullWavUrl = null;
+  let alarmAudioEl = null;
+  /** Scheduled gap between katsu speech bursts; cleared by stopAlertSound. */
+  let katsuSpeechPauseTimeoutId = null;
 
-  function unlockAudio() {
-    primeHtml5Alarm();
+  /** Warm up speech voices (needed on some mobile browsers after a user gesture). */
+  function primeSpeechSynthesis() {
     try {
-      const Ctx = window.AudioContext || window.webkitAudioContext;
-      if (!Ctx) return;
-      if (!sharedAudioCtx) sharedAudioCtx = new Ctx();
-      const ctx = sharedAudioCtx;
-      const p = ctx.state === "suspended" ? ctx.resume() : Promise.resolve();
-      p
-        .then(() => {
-          /* Inaudible priming pass — helps Mobile Safari treat the context as user-started. */
-          const osc = ctx.createOscillator();
-          const g = ctx.createGain();
-          g.gain.value = 0;
-          osc.connect(g);
-          g.connect(ctx.destination);
-          const t = ctx.currentTime;
-          osc.start(t);
-          osc.stop(t + 0.001);
-        })
-        .catch(() => {});
+      const syn = window.speechSynthesis;
+      if (syn) syn.getVoices();
     } catch {
       /* ignore */
     }
-  }
-
-  function bindAudioUnlockOnFirstGesture() {
-    if (audioUnlockBound) return;
-    audioUnlockBound = true;
-    const onUnlock = () => {
-      unlockAudio();
-    };
-    document.addEventListener("pointerdown", onUnlock, true);
-    document.addEventListener("touchstart", onUnlock, true);
-    document.addEventListener("click", onUnlock, true);
   }
 
   function setAscii(view, offset, str) {
     for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
   }
 
-  /** Pre-rendered twin-bell pattern (~same timing as Web Audio alarm) as 16-bit mono WAV bytes. */
+  /** Pre-rendered twin-bell pattern as 16-bit mono WAV bytes. */
   function buildAlarmWavBytes() {
     const sampleRate = 22050;
     const bell1 = 1046;
@@ -241,7 +220,6 @@
     });
   }
 
-  /** Inaudible / low-gain play so Mobile Safari allows later .play() when the timer fires. */
   function primeHtml5Alarm() {
     if (alarmAudioPrimed) return;
     void (async () => {
@@ -259,9 +237,46 @@
         el.volume = prevVol > 0 ? prevVol : 1;
         alarmAudioPrimed = true;
       } catch {
-        /* Next tap / timer end will retry or use Web Audio. */
+        /* ignore */
       }
     })();
+  }
+
+  function unlockAudio() {
+    primeHtml5Alarm();
+    primeSpeechSynthesis();
+    try {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return;
+      if (!sharedAudioCtx) sharedAudioCtx = new Ctx();
+      const ctx = sharedAudioCtx;
+      const p = ctx.state === "suspended" ? ctx.resume() : Promise.resolve();
+      p
+        .then(() => {
+          const osc = ctx.createOscillator();
+          const g = ctx.createGain();
+          g.gain.value = 0;
+          osc.connect(g);
+          g.connect(ctx.destination);
+          const t0 = ctx.currentTime;
+          osc.start(t0);
+          osc.stop(t0 + 0.001);
+        })
+        .catch(() => {});
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function bindAudioUnlockOnFirstGesture() {
+    if (audioUnlockBound) return;
+    audioUnlockBound = true;
+    const onUnlock = () => {
+      unlockAudio();
+    };
+    document.addEventListener("pointerdown", onUnlock, true);
+    document.addEventListener("touchstart", onUnlock, true);
+    document.addEventListener("click", onUnlock, true);
   }
 
   function tryVibrateAlarm() {
@@ -289,7 +304,17 @@
     return `${m}:${r.toString().padStart(2, "0")}`;
   }
 
+  /** Stops speech and the mechanical alarm (e.g. when DONE is pressed). */
   function stopAlertSound() {
+    if (katsuSpeechPauseTimeoutId != null) {
+      clearTimeout(katsuSpeechPauseTimeoutId);
+      katsuSpeechPauseTimeoutId = null;
+    }
+    try {
+      if (window.speechSynthesis) window.speechSynthesis.cancel();
+    } catch {
+      /* ignore */
+    }
     try {
       if (alarmAudioEl) {
         alarmAudioEl.pause();
@@ -299,16 +324,86 @@
       /* ignore */
     }
     try {
-      if (!sharedAudioCtx || !alertOutputGain) return;
-      const ctx = sharedAudioCtx;
-      const now = ctx.currentTime;
-      alertOutputGain.gain.cancelScheduledValues(now);
-      alertOutputGain.gain.setValueAtTime(0, now);
-      alertOutputGain.disconnect();
-      alertOutputGain = null;
+      if (sharedAudioCtx && alertOutputGain) {
+        const ctx = sharedAudioCtx;
+        const now = ctx.currentTime;
+        alertOutputGain.gain.cancelScheduledValues(now);
+        alertOutputGain.gain.setValueAtTime(0, now);
+        alertOutputGain.disconnect();
+        alertOutputGain = null;
+      }
     } catch {
       alertOutputGain = null;
     }
+  }
+
+  function isChickenKatsuOnlyTimer(t) {
+    if (Array.isArray(t.presetKeys) && t.presetKeys.length === 1 && t.presetKeys[0] === "chicken-katsu") {
+      return true;
+    }
+    const n = (t.dishName || "").trim();
+    return n === DISH_PRESETS["chicken-katsu"].label;
+  }
+
+  function isPorkKatsuCookTimerForSpeech(t) {
+    if (t.skipPorkRestFlow) return false;
+    const raw = (t.dishName || "").trim().toLowerCase();
+    if (raw.includes("— rest")) return false;
+    if (Array.isArray(t.presetKeys) && t.presetKeys.length === 1 && PORK_REST_DISH_KEYS.has(t.presetKeys[0])) {
+      return true;
+    }
+    return (
+      raw === String(DISH_PRESETS["pork-katsu-thick"].label).toLowerCase() ||
+      raw === String(DISH_PRESETS["pork-katsu-thin"].label).toLowerCase()
+    );
+  }
+
+  function pickEnglishMaleVoice(voices) {
+    const en = voices.filter((v) => /^en/i.test(v.lang));
+    let v = en.find((x) => /male/i.test(x.name));
+    if (v) return v;
+    v = voices.find((x) => /male/i.test(x.name));
+    return v || null;
+  }
+
+  /**
+   * Says `word` three times in one utterance (tight, no gaps), 1s silence, then repeats once.
+   */
+  function speakKatsuWordBurst(word, opts) {
+    opts = opts || {};
+    const syn = window.speechSynthesis;
+    if (!syn) return;
+    const lang = document.documentElement.lang || "en-US";
+    const voices = syn.getVoices();
+    let voice = null;
+    if (opts.preferMale) voice = pickEnglishMaleVoice(voices);
+    const pitch = opts.pitch != null ? opts.pitch : 1;
+    const rate = opts.rate != null ? opts.rate : 1.1;
+
+    const triple = `${word} ${word} ${word}`;
+
+    const make = (text) => {
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = lang;
+      u.rate = rate;
+      u.pitch = pitch;
+      if (voice) u.voice = voice;
+      return u;
+    };
+
+    const u1 = make(triple);
+    const u2 = make(triple);
+    u1.onend = () => {
+      katsuSpeechPauseTimeoutId = window.setTimeout(() => {
+        katsuSpeechPauseTimeoutId = null;
+        try {
+          syn.speak(u2);
+        } catch {
+          /* ignore */
+        }
+      }, 1000);
+    };
+    syn.speak(u1);
   }
 
   async function playWebAudioAlarm() {
@@ -330,7 +425,6 @@
     master.connect(ctx.destination);
     alertOutputGain = master;
 
-    /* Twin-bell mechanical alarm: hammer alternates between two metal tones. */
     const bell1 = 1046;
     const bell2 = 1320;
     const strikeInterval = 0.068;
@@ -373,7 +467,6 @@
         harm.stop(strikeT + ringDecay + 0.015);
       }
 
-      /* Quiet motor / spring undertone */
       const buzz = ctx.createOscillator();
       const buzzG = ctx.createGain();
       buzz.type = "square";
@@ -389,9 +482,7 @@
     }
   }
 
-  async function playAlertSound() {
-    stopAlertSound();
-    tryVibrateAlarm();
+  async function playMechanicalAlarm() {
     try {
       const el = ensureAlarmAudioElement();
       await whenAlarmAudioReady(el);
@@ -409,6 +500,32 @@
     }
   }
 
+  /**
+   * phase "cook": Chicken/Pork katsu get burst TTS; others mechanical.
+   * phase "rest": always mechanical (e.g. pork 1-minute rest phase finished).
+   */
+  async function playAlertSound(t, options) {
+    const phase = options && options.phase === "rest" ? "rest" : "cook";
+    stopAlertSound();
+    tryVibrateAlarm();
+
+    if (phase === "rest") {
+      await playMechanicalAlarm();
+      return;
+    }
+
+    if (isChickenKatsuOnlyTimer(t)) {
+      speakKatsuWordBurst("chicken", { pitch: 1, preferMale: false });
+      return;
+    }
+    if (isPorkKatsuCookTimerForSpeech(t)) {
+      speakKatsuWordBurst("pork", { pitch: 1.3, preferMale: true });
+      return;
+    }
+
+    await playMechanicalAlarm();
+  }
+
   function durationSecForDish(key) {
     const preset = DISH_PRESETS[key];
     if (!preset || preset.durationSec == null) return null;
@@ -421,14 +538,21 @@
   }
 
   function timerNeedsPorkRest(t) {
+    if (t.skipPorkRestFlow) return false;
     if (Array.isArray(t.presetKeys) && t.presetKeys.length === 1) {
       return PORK_REST_DISH_KEYS.has(t.presetKeys[0]);
     }
     const name = (t.dishName || "").trim().toLowerCase();
+    if (name.includes("— rest (1 min)")) return false;
     return (
       name === String(DISH_PRESETS["pork-katsu-thick"].label).toLowerCase() ||
       name === String(DISH_PRESETS["pork-katsu-thin"].label).toLowerCase()
     );
+  }
+
+  function startImmediatePorkRestTimer() {
+    showAddError("");
+    addTimer("Pork katsu — rest (1 min)", 1, 60, null, { skipPorkRestFlow: true });
   }
 
   function moveTimerToJustFinished(tab, t) {
@@ -495,7 +619,12 @@
     host.innerHTML = "";
     selectedDishKeyOrder = [];
 
-    const inCategory = new Set([...DISH_CATEGORY_CHICKEN, ...DISH_CATEGORY_PORK, ...DISH_CATEGORY_TERIYAKI]);
+    const inCategory = new Set([
+      ...DISH_CATEGORY_CHICKEN,
+      ...DISH_CATEGORY_PORK,
+      ...DISH_CATEGORY_TERIYAKI,
+      ...DISH_CATEGORY_FISH,
+    ]);
     const otherKeys = Object.keys(DISH_PRESETS)
       .filter((k) => !inCategory.has(k))
       .sort((a, b) =>
@@ -506,6 +635,7 @@
       { title: "Chicken", keys: DISH_CATEGORY_CHICKEN },
       { title: "Pork", keys: DISH_CATEGORY_PORK },
       { title: "Teriyaki", keys: DISH_CATEGORY_TERIYAKI },
+      { title: "Fish", keys: DISH_CATEGORY_FISH },
       { title: "Other dishes", keys: otherKeys },
     ];
 
@@ -541,6 +671,23 @@
         });
         grid.append(btn);
       });
+
+      if (section.title === "Pork") {
+        const restWrap = document.createElement("div");
+        restWrap.className = "dish-pork-rest-wrap";
+        const restBtn = document.createElement("button");
+        restBtn.type = "button";
+        restBtn.className = "dish-rest-btn";
+        restBtn.textContent = "1 minute resting";
+        restBtn.title = "Start a 1-minute pork katsu resting timer";
+        restBtn.setAttribute("aria-label", "One minute resting timer for pork katsu");
+        restBtn.addEventListener("click", () => {
+          unlockAudio();
+          startImmediatePorkRestTimer();
+        });
+        restWrap.append(restBtn);
+        grid.append(restWrap);
+      }
 
       region.append(grid);
       host.append(region);
@@ -619,7 +766,7 @@
     t.endAt = null;
     if (!soundPlayedFor.has(`${t.id}:rest`)) {
       soundPlayedFor.add(`${t.id}:rest`);
-      playAlertSound();
+      playAlertSound(t, { phase: "rest" });
     }
     persist();
   }
@@ -633,7 +780,7 @@
     t.endAt = null;
     if (!soundPlayedFor.has(t.id)) {
       soundPlayedFor.add(t.id);
-      playAlertSound();
+      playAlertSound(t);
     }
     persist();
   }
@@ -647,7 +794,7 @@
     persist();
   }
 
-  function addTimer(dishName, quantity, durationSec, presetKeys) {
+  function addTimer(dishName, quantity, durationSec, presetKeys, opts) {
     const tab = activeTab();
     if (!dishName) {
       showAddError("Select one or more dishes with the same cook time.");
@@ -664,6 +811,7 @@
       pausedRemainingSec: null,
       createdAt: Date.now(),
       presetKeys: Array.isArray(presetKeys) && presetKeys.length ? presetKeys.slice() : null,
+      skipPorkRestFlow: !!(opts && opts.skipPorkRestFlow),
     };
     tab.timers.push(t);
     soundPlayedFor.delete(t.id);
