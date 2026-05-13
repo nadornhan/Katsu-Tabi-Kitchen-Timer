@@ -13,7 +13,7 @@
   /** One fixed cook duration per dish (seconds), same for every quantity 1–5. */
   const DISH_PRESETS = {
     "brussels-sprouts": { label: "Brussels Sprouts", durationSec: 3 * 60 },
-    "agedashi-tofu": { label: "Agedashi Tofu", durationSec: 3 * 60 },
+    "agedashi-tofu": { label: "Agedashi Tofu", durationSec: 5 * 60 },
     "baby-prawns": { label: "Baby Prawn", durationSec: 3 * 60 },
     karaage: { label: "Karaage", durationSec: 5 * 60 + 30 },
     takoyaki: { label: "Takoyaki", durationSec: 5 * 60 + 30 },
@@ -108,18 +108,6 @@
   let alarmAudioPrimed = false;
   let alarmFullWavUrl = null;
   let alarmAudioEl = null;
-  /** Scheduled gap between katsu speech bursts; cleared by stopAlertSound. */
-  let katsuSpeechPauseTimeoutId = null;
-
-  /** Warm up speech voices (needed on some mobile browsers after a user gesture). */
-  function primeSpeechSynthesis() {
-    try {
-      const syn = window.speechSynthesis;
-      if (syn) syn.getVoices();
-    } catch {
-      /* ignore */
-    }
-  }
 
   function setAscii(view, offset, str) {
     for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
@@ -244,7 +232,6 @@
 
   function unlockAudio() {
     primeHtml5Alarm();
-    primeSpeechSynthesis();
     try {
       const Ctx = window.AudioContext || window.webkitAudioContext;
       if (!Ctx) return;
@@ -304,12 +291,8 @@
     return `${m}:${r.toString().padStart(2, "0")}`;
   }
 
-  /** Stops speech and the mechanical alarm (e.g. when DONE is pressed). */
+  /** Stops the mechanical alarm (e.g. when DONE is pressed). */
   function stopAlertSound() {
-    if (katsuSpeechPauseTimeoutId != null) {
-      clearTimeout(katsuSpeechPauseTimeoutId);
-      katsuSpeechPauseTimeoutId = null;
-    }
     try {
       if (window.speechSynthesis) window.speechSynthesis.cancel();
     } catch {
@@ -335,75 +318,6 @@
     } catch {
       alertOutputGain = null;
     }
-  }
-
-  function isChickenKatsuOnlyTimer(t) {
-    if (Array.isArray(t.presetKeys) && t.presetKeys.length === 1 && t.presetKeys[0] === "chicken-katsu") {
-      return true;
-    }
-    const n = (t.dishName || "").trim();
-    return n === DISH_PRESETS["chicken-katsu"].label;
-  }
-
-  function isPorkKatsuCookTimerForSpeech(t) {
-    if (t.skipPorkRestFlow) return false;
-    const raw = (t.dishName || "").trim().toLowerCase();
-    if (raw.includes("— rest")) return false;
-    if (Array.isArray(t.presetKeys) && t.presetKeys.length === 1 && PORK_REST_DISH_KEYS.has(t.presetKeys[0])) {
-      return true;
-    }
-    return (
-      raw === String(DISH_PRESETS["pork-katsu-thick"].label).toLowerCase() ||
-      raw === String(DISH_PRESETS["pork-katsu-thin"].label).toLowerCase()
-    );
-  }
-
-  function pickEnglishMaleVoice(voices) {
-    const en = voices.filter((v) => /^en/i.test(v.lang));
-    let v = en.find((x) => /male/i.test(x.name));
-    if (v) return v;
-    v = voices.find((x) => /male/i.test(x.name));
-    return v || null;
-  }
-
-  /**
-   * Says `word` three times in one utterance (tight, no gaps), 1s silence, then repeats once.
-   */
-  function speakKatsuWordBurst(word, opts) {
-    opts = opts || {};
-    const syn = window.speechSynthesis;
-    if (!syn) return;
-    const lang = document.documentElement.lang || "en-US";
-    const voices = syn.getVoices();
-    let voice = null;
-    if (opts.preferMale) voice = pickEnglishMaleVoice(voices);
-    const pitch = opts.pitch != null ? opts.pitch : 1;
-    const rate = opts.rate != null ? opts.rate : 1.1;
-
-    const triple = `${word} ${word} ${word}`;
-
-    const make = (text) => {
-      const u = new SpeechSynthesisUtterance(text);
-      u.lang = lang;
-      u.rate = rate;
-      u.pitch = pitch;
-      if (voice) u.voice = voice;
-      return u;
-    };
-
-    const u1 = make(triple);
-    const u2 = make(triple);
-    u1.onend = () => {
-      katsuSpeechPauseTimeoutId = window.setTimeout(() => {
-        katsuSpeechPauseTimeoutId = null;
-        try {
-          syn.speak(u2);
-        } catch {
-          /* ignore */
-        }
-      }, 1000);
-    };
-    syn.speak(u1);
   }
 
   async function playWebAudioAlarm() {
@@ -500,29 +414,9 @@
     }
   }
 
-  /**
-   * phase "cook": Chicken/Pork katsu get burst TTS; others mechanical.
-   * phase "rest": always mechanical (e.g. pork 1-minute rest phase finished).
-   */
-  async function playAlertSound(t, options) {
-    const phase = options && options.phase === "rest" ? "rest" : "cook";
+  async function playAlertSound() {
     stopAlertSound();
     tryVibrateAlarm();
-
-    if (phase === "rest") {
-      await playMechanicalAlarm();
-      return;
-    }
-
-    if (isChickenKatsuOnlyTimer(t)) {
-      speakKatsuWordBurst("chicken", { pitch: 1, preferMale: false });
-      return;
-    }
-    if (isPorkKatsuCookTimerForSpeech(t)) {
-      speakKatsuWordBurst("pork", { pitch: 1.3, preferMale: true });
-      return;
-    }
-
     await playMechanicalAlarm();
   }
 
@@ -766,7 +660,7 @@
     t.endAt = null;
     if (!soundPlayedFor.has(`${t.id}:rest`)) {
       soundPlayedFor.add(`${t.id}:rest`);
-      playAlertSound(t, { phase: "rest" });
+      playAlertSound();
     }
     persist();
   }
@@ -780,7 +674,7 @@
     t.endAt = null;
     if (!soundPlayedFor.has(t.id)) {
       soundPlayedFor.add(t.id);
-      playAlertSound(t);
+      playAlertSound();
     }
     persist();
   }
