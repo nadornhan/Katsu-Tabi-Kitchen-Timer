@@ -17,7 +17,7 @@
     "baby-prawns": { label: "Baby Prawn", durationSec: 3 * 60 },
     karaage: { label: "Karaage", durationSec: 5 * 60 + 30 },
     takoyaki: { label: "Takoyaki", durationSec: 5 * 60 + 30 },
-    korokke: { label: "Korokke", durationSec: 5 * 60 + 30 },
+    korokke: { label: "Korokke", durationSec: 5 * 60 + 35 },
     prawn: { label: "Prawn", durationSec: 5 * 60 + 30 },
     "chicken-katsu": { label: "Chicken Katsu", durationSec: 5 * 60 + 25 },
     "pork-katsu-thick": { label: "Pork Katsu Thick", durationSec: 4 * 60 + 25 },
@@ -452,7 +452,7 @@
   function moveTimerToJustFinished(tab, t) {
     stopAlertSound();
     tab.timers = tab.timers.filter((x) => x.id !== t.id);
-    tab.justFinished.push({
+    tab.justFinished.unshift({
       id: uuid(),
       dishName: t.dishName,
       quantity: t.quantity,
@@ -656,6 +656,7 @@
   function tryCompleteRestTimer(t) {
     if (t.state !== "resting") return;
     if (timerRemainingMs(t) > 0) return;
+    t.completedAt = t.endAt || Date.now();
     t.state = "rest_done";
     t.endAt = null;
     if (!soundPlayedFor.has(`${t.id}:rest`)) {
@@ -668,6 +669,7 @@
   function tryCompleteTimer(t) {
     if (t.state !== "running") return;
     if (timerRemainingMs(t) > 0) return;
+    t.completedAt = t.endAt || Date.now();
     t.state = "done";
     t.pausedRemainingMs = null;
     t.pausedRemainingSec = 0;
@@ -743,7 +745,17 @@
   }
 
   function sortTimers(tab) {
-    tab.timers.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+    const isDone = (timer) => timer.state === "done" || timer.state === "rest_done";
+    tab.timers.sort((a, b) => {
+      const donePriority = Number(isDone(b)) - Number(isDone(a));
+      if (donePriority) return donePriority;
+      if (isDone(a)) {
+        const completedOrder = (b.completedAt || b.createdAt || 0) -
+          (a.completedAt || a.createdAt || 0);
+        if (completedOrder) return completedOrder;
+      }
+      return (b.createdAt || 0) - (a.createdAt || 0);
+    });
   }
 
   function renderTabs() {

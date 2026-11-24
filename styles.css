@@ -756,3 +756,72 @@ body {
     font-size: 1.38rem;
   }
 }
+
+/* Compact active cards keep the countdown prominent and more dishes in view. */
+#timer-list { gap: 0.6rem; }
+#timer-list .timer-card { min-width: 0; padding: 0.75rem; }
+#timer-list .timer-top { gap: 0.45rem; margin-bottom: 0; }
+#timer-list .timer-top > div:first-child { min-width: 0; }
+#timer-list .timer-dish { font-size: 1.3rem; line-height: 1.15; }
+#timer-list .timer-meta,
+#timer-list .timer-rest-note { margin-top: 0.2rem; line-height: 1.25; }
+#timer-list .timer-remaining {
+  flex-shrink: 0;
+  padding: 0.3rem 0.5rem;
+  border-radius: 8px;
+  background: var(--accent-soft);
+  color: #92400e;
+  font-size: 2.25rem;
+  font-weight: 800;
+  line-height: 1.1;
+  letter-spacing: -0.04em;
+  white-space: nowrap;
+}
+#timer-list .timer-card--done .timer-remaining {
+  background: var(--green-soft);
+  color: #166534;
+}
+#timer-list .timer-actions { gap: 0.3rem; margin-top: 0.5rem; }
+#timer-list .timer-actions .btn { min-height: 44px; }
+#timer-list .timer-done-right { gap: 0.4rem; }
+#timer-list .btn-done {
+  min-height: 44px;
+  min-width: 0;
+  padding: 0.55rem 0.85rem;
+}
+@media (max-width: 520px) {
+  #timer-list {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0.45rem;
+    align-items: start;
+  }
+  #timer-list .timer-card { padding: 0.55rem; }
+  #timer-list .timer-top,
+  #timer-list .timer-done-right {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 0.35rem;
+  }
+  #timer-list .timer-dish {
+    font-family: var(--font);
+    font-size: 1rem;
+    line-height: 1.2;
+  }
+  #timer-list .timer-meta,
+  #timer-list .timer-rest-note { font-size: 0.75rem; }
+  #timer-list .timer-remaining {
+    font-size: clamp(1.8rem, 8vw, 2.25rem);
+    text-align: center;
+    padding: 0.3rem 0.2rem;
+  }
+  #timer-list .timer-actions .btn {
+    flex: 1 1 auto;
+    padding: 0.35rem;
+    font-size: 0.75rem;
+  }
+  #timer-list .btn-done { width: 100%; }
+}
+@media (max-width: 359px) {
+  #timer-list { grid-template-columns: minmax(0, 1fr); }
+}
