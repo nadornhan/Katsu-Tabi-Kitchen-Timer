@@ -103,23 +103,17 @@
   let selectedDishKeyOrder = [];
   let audioUnlockBound = false;
   let sharedAudioCtx = null;
-  /** Master gain for the mechanical alarm; silenced by stopAlertSound. */
-  let alertOutputGain = null;
-  let alarmAudioPrimed = false;
   let alarmFullWavUrl = null;
-  let alarmAudioEl = null;
-  let audioPrimePromise = null;
-  let alarmAttempt = null;
-  let alarmGeneration = 0;
-  let nextAlarmAttemptAt = 0;
-  const pendingAlarms = new Set();
+  let alarmBuffer = null;
+  const pendingAlarms = new Map();
+  const alarmVoices = new Map();
 
   function withAudioTimeout(promise) {
     let handle;
     return Promise.race([
       promise,
       new Promise((_, reject) => {
-        handle = setTimeout(() => reject(new Error("audio-timeout")), 1500);
+        handle = setTimeout(() => reject(new Error("audio-timeout")), 1200);
       }),
     ]).finally(() => clearTimeout(handle));
   }
@@ -202,58 +196,47 @@
     return alarmFullWavUrl;
   }
 
-  function ensureAlarmAudioElement() {
-    if (alarmAudioEl) return alarmAudioEl;
-    const el = document.createElement("audio");
-    el.preload = "auto";
-    el.setAttribute("playsinline", "");
-    el.setAttribute("webkit-playsinline", "");
-    el.src = getAlarmFullWavUrl();
-    el.style.display = "none";
-    document.body.appendChild(el);
-    alarmAudioEl = el;
-    return el;
+  function getAudioContext() {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return null;
+    if (!sharedAudioCtx || sharedAudioCtx.state === "closed") {
+      sharedAudioCtx = new Ctx();
+      alarmBuffer = null;
+    }
+    return sharedAudioCtx;
   }
 
-  function primeHtml5Alarm() {
-    if (alarmAudioPrimed || audioPrimePromise || alarmAttempt) return;
-    const el = ensureAlarmAudioElement();
-    // Call play synchronously inside the gesture, before any await.
-    el.volume = 0.02;
-    audioPrimePromise = withAudioTimeout(el.play())
-      .then(() => { alarmAudioPrimed = true; })
-      .catch(() => {})
-      .finally(() => {
-        el.pause();
-        el.currentTime = 0;
-        el.volume = 1;
-        audioPrimePromise = null;
-      });
+  function getAlarmBuffer(ctx) {
+    if (!alarmBuffer) {
+      const bytes = buildAlarmWavBytes();
+      const view = new DataView(bytes.buffer);
+      const samples = (bytes.length - 44) / 2;
+      alarmBuffer = ctx.createBuffer(1, samples, 22050);
+      const channel = alarmBuffer.getChannelData(0);
+      for (let i = 0; i < samples; i++) {
+        channel[i] = view.getInt16(44 + i * 2, true) / 32768;
+      }
+    }
+    return alarmBuffer;
   }
 
   function unlockAudio() {
-    primeHtml5Alarm();
     try {
-      const Ctx = window.AudioContext || window.webkitAudioContext;
-      if (!Ctx) return;
-      if (!sharedAudioCtx) sharedAudioCtx = new Ctx();
-      const ctx = sharedAudioCtx;
-      const p = (ctx.state === "suspended" || ctx.state === "interrupted") ? ctx.resume() : Promise.resolve();
-      p
-        .then(() => {
-          const osc = ctx.createOscillator();
-          const g = ctx.createGain();
-          g.gain.value = 0;
-          osc.connect(g);
-          g.connect(ctx.destination);
-          const t0 = ctx.currentTime;
-          osc.start(t0);
-          osc.stop(t0 + 0.001);
-        })
-        .catch(() => {});
-    } catch {
-      /* ignore */
-    }
+      // Ask iOS for media playback routing when supported.
+      if (navigator.audioSession) navigator.audioSession.type = "playback";
+    } catch { /* Older browsers do not expose AudioSession. */ }
+    try {
+      const ctx = getAudioContext();
+      if (!ctx) return;
+      // Both resume and start run directly in the user gesture.
+      if (ctx.state !== "running") void ctx.resume().catch(() => {});
+      const source = ctx.createBufferSource();
+      source.buffer = ctx.createBuffer(1, 1, ctx.sampleRate);
+      source.connect(ctx.destination);
+      source.onended = () => source.disconnect();
+      source.start();
+      getAlarmBuffer(ctx);
+    } catch { /* Pending alarms retry after the next gesture. */ }
   }
 
   function bindAudioUnlockOnFirstGesture() {
@@ -261,22 +244,103 @@
     audioUnlockBound = true;
     const onUnlock = () => {
       unlockAudio();
-      nextAlarmAttemptAt = 0;
-      void flushPendingAlarms();
+      pendingAlarms.forEach((attempt) => { attempt.retryAt = 0; });
+      flushPendingAlarms();
     };
     document.addEventListener("pointerdown", onUnlock, true);
-    document.addEventListener("touchstart", onUnlock, true);
+    document.addEventListener("touchend", onUnlock, true);
     document.addEventListener("click", onUnlock, true);
+    document.addEventListener("keydown", onUnlock, true);
   }
 
   function tryVibrateAlarm() {
     try {
-      if (typeof navigator !== "undefined" && navigator.vibrate) {
-        navigator.vibrate([180, 100, 180, 100, 280]);
+      if (navigator.vibrate) navigator.vibrate([180, 100, 180, 100, 280]);
+    } catch { /* Vibration is optional. */ }
+  }
+
+  function stopAlarmKey(key) {
+    const attempt = pendingAlarms.get(key);
+    if (attempt) attempt.cancelled = true;
+    pendingAlarms.delete(key);
+    const voice = alarmVoices.get(key);
+    if (voice) voice.stop();
+    alarmVoices.delete(key);
+  }
+
+  // Acknowledging one dish must never silence another dish's alarm.
+  function stopAlertSound(timerId) {
+    stopAlarmKey(timerId);
+    stopAlarmKey(timerId + ":rest");
+  }
+
+  async function playAlarm(key, attempt) {
+    try {
+      const ctx = getAudioContext();
+      if (ctx) {
+        if (ctx.state !== "running") await withAudioTimeout(ctx.resume());
+        if (attempt.cancelled) return false;
+        if (ctx.state === "running") {
+          const source = ctx.createBufferSource();
+          source.buffer = getAlarmBuffer(ctx);
+          source.connect(ctx.destination);
+          const voice = { stop: () => { source.stop(); source.disconnect(); } };
+          source.onended = () => {
+            source.disconnect();
+            if (alarmVoices.get(key) === voice) alarmVoices.delete(key);
+          };
+          alarmVoices.set(key, voice);
+          source.start();
+          return true;
+        }
       }
+    } catch { /* Fall back to an independent HTML audio element. */ }
+    if (attempt.cancelled) return false;
+    const el = document.createElement("audio");
+    el.src = getAlarmFullWavUrl();
+    el.setAttribute("playsinline", "");
+    el.volume = 1;
+    const voice = { stop: () => { el.pause(); el.remove(); } };
+    alarmVoices.set(key, voice);
+    el.onended = () => {
+      el.remove();
+      if (alarmVoices.get(key) === voice) alarmVoices.delete(key);
+    };
+    try {
+      await withAudioTimeout(el.play());
+      if (attempt.cancelled) { voice.stop(); return false; }
+      return true;
     } catch {
-      /* ignore */
+      voice.stop();
+      if (alarmVoices.get(key) === voice) alarmVoices.delete(key);
+      return false;
     }
+  }
+
+  function queueAlarm(key) {
+    if (soundPlayedFor.has(key) || pendingAlarms.has(key)) return;
+    pendingAlarms.set(key, { inFlight: false, retryAt: 0, cancelled: false });
+    flushPendingAlarms();
+  }
+
+  function flushPendingAlarms() {
+    // Each dish starts independently; no shared lock, cooldown, or batching.
+    pendingAlarms.forEach((attempt, key) => {
+      if (attempt.inFlight || attempt.retryAt > Date.now()) return;
+      attempt.inFlight = true;
+      tryVibrateAlarm();
+      void playAlarm(key, attempt).then((played) => {
+        if (attempt.cancelled) return;
+        if (played) {
+          soundPlayedFor.add(key);
+          pendingAlarms.delete(key);
+        } else {
+          attempt.retryAt = Date.now() + 1000;
+        }
+      }).catch(() => {
+        attempt.retryAt = Date.now() + 1000;
+      }).finally(() => { attempt.inFlight = false; });
+    });
   }
 
   function activeTab() {
@@ -292,162 +356,6 @@
     const m = Math.floor(s / 60);
     const r = s % 60;
     return `${m}:${r.toString().padStart(2, "0")}`;
-  }
-
-  /** Stops the mechanical alarm (e.g. when DONE is pressed). */
-  function stopAlertSound() {
-    alarmGeneration++;
-    pendingAlarms.forEach((key) => soundPlayedFor.add(key));
-    pendingAlarms.clear();
-    try {
-      if (window.speechSynthesis) window.speechSynthesis.cancel();
-    } catch {
-      /* ignore */
-    }
-    try {
-      if (alarmAudioEl) {
-        alarmAudioEl.pause();
-        alarmAudioEl.currentTime = 0;
-      }
-    } catch {
-      /* ignore */
-    }
-    try {
-      if (sharedAudioCtx && alertOutputGain) {
-        const ctx = sharedAudioCtx;
-        const now = ctx.currentTime;
-        alertOutputGain.gain.cancelScheduledValues(now);
-        alertOutputGain.gain.setValueAtTime(0, now);
-        alertOutputGain.disconnect();
-        alertOutputGain = null;
-      }
-    } catch {
-      alertOutputGain = null;
-    }
-  }
-
-  async function playWebAudioAlarm(generation) {
-    const Ctx = window.AudioContext || window.webkitAudioContext;
-    if (!Ctx) return false;
-    if (!sharedAudioCtx) sharedAudioCtx = new Ctx();
-    const ctx = sharedAudioCtx;
-    if ((ctx.state === "suspended" || ctx.state === "interrupted")) {
-      try {
-        await withAudioTimeout(ctx.resume());
-      } catch {
-        return;
-      }
-    }
-    if (ctx.state !== "running" || generation !== alarmGeneration) return false;
-    const t0 = ctx.currentTime;
-    const master = ctx.createGain();
-    master.gain.setValueAtTime(0.52, t0);
-    master.connect(ctx.destination);
-    alertOutputGain = master;
-
-    const bell1 = 1046;
-    const bell2 = 1320;
-    const strikeInterval = 0.068;
-    const ringDecay = 0.088;
-    const totalTime = 2.45;
-    const numStrikes = Math.floor(totalTime / strikeInterval);
-    const gapBetweenAlarms = 0.38;
-
-    for (let round = 0; round < 2; round++) {
-      const tBase = t0 + round * (totalTime + gapBetweenAlarms);
-
-      for (let n = 0; n < numStrikes; n++) {
-        const strikeT = tBase + n * strikeInterval;
-        const baseFreq = n % 2 === 0 ? bell1 : bell2;
-        const wobble = 1 + (n % 5) * 0.003;
-        const freq = baseFreq * wobble;
-
-        const tri = ctx.createOscillator();
-        const triG = ctx.createGain();
-        tri.type = "triangle";
-        tri.frequency.setValueAtTime(freq, strikeT);
-        triG.gain.setValueAtTime(0.0008, strikeT);
-        triG.gain.exponentialRampToValueAtTime(0.26, strikeT + 0.002);
-        triG.gain.exponentialRampToValueAtTime(0.0008, strikeT + ringDecay);
-        tri.connect(triG);
-        triG.connect(master);
-        tri.start(strikeT);
-        tri.stop(strikeT + ringDecay + 0.015);
-
-        const harm = ctx.createOscillator();
-        const harmG = ctx.createGain();
-        harm.type = "sine";
-        harm.frequency.setValueAtTime(freq * 2.8, strikeT);
-        harmG.gain.setValueAtTime(0.0008, strikeT);
-        harmG.gain.exponentialRampToValueAtTime(0.09, strikeT + 0.002);
-        harmG.gain.exponentialRampToValueAtTime(0.0008, strikeT + ringDecay * 0.85);
-        harm.connect(harmG);
-        harmG.connect(master);
-        harm.start(strikeT);
-        harm.stop(strikeT + ringDecay + 0.015);
-      }
-
-      const buzz = ctx.createOscillator();
-      const buzzG = ctx.createGain();
-      buzz.type = "square";
-      buzz.frequency.setValueAtTime(118, tBase);
-      buzzG.gain.setValueAtTime(0.0008, tBase);
-      buzzG.gain.exponentialRampToValueAtTime(0.045, tBase + 0.08);
-      buzzG.gain.setValueAtTime(0.045, tBase + totalTime - 0.12);
-      buzzG.gain.exponentialRampToValueAtTime(0.0008, tBase + totalTime);
-      buzz.connect(buzzG);
-      buzzG.connect(master);
-      buzz.start(tBase);
-      buzz.stop(tBase + totalTime + 0.04);
-    }
-    return true;
-  }
-
-  async function playMechanicalAlarm(generation) {
-    try {
-      const el = ensureAlarmAudioElement();
-      el.currentTime = 0;
-      el.volume = 1;
-      await withAudioTimeout(el.play());
-      return generation === alarmGeneration;
-    } catch {
-      if (alarmAudioEl) alarmAudioEl.pause();
-    }
-    if (generation !== alarmGeneration) return false;
-    try {
-      return await playWebAudioAlarm(generation);
-    } catch {
-      return false;
-    }
-  }
-
-  function queueAlarm(key) {
-    if (!soundPlayedFor.has(key)) pendingAlarms.add(key);
-  }
-
-  async function flushPendingAlarms() {
-    if (alarmAttempt || !pendingAlarms.size || Date.now() < nextAlarmAttemptAt) return;
-    const generation = alarmGeneration;
-    const keys = [...pendingAlarms];
-    alarmAttempt = (async () => {
-      if (audioPrimePromise) await audioPrimePromise;
-      if (generation !== alarmGeneration) return;
-      tryVibrateAlarm();
-      const played = await playMechanicalAlarm(generation);
-      if (generation !== alarmGeneration) return;
-      if (played) {
-        keys.forEach((key) => {
-          soundPlayedFor.add(key);
-          pendingAlarms.delete(key);
-        });
-      }
-      nextAlarmAttemptAt = Date.now() + 2000;
-    })();
-    try {
-      await alarmAttempt;
-    } finally {
-      alarmAttempt = null;
-    }
   }
 
   function durationSecForDish(key) {
@@ -480,7 +388,7 @@
   }
 
   function moveTimerToJustFinished(tab, t) {
-    stopAlertSound();
+    stopAlertSound(t.id);
     tab.timers = tab.timers.filter((x) => x.id !== t.id);
     tab.justFinished.unshift({
       id: uuid(),
@@ -833,6 +741,7 @@
 
   function removeTab(id) {
     if (state.tabs.length <= 1) return;
+    state.tabs.find((tab) => tab.id === id)?.timers.forEach((t) => stopAlertSound(t.id));
     state.tabs = state.tabs.filter((t) => t.id !== id);
     if (state.activeTabId === id) state.activeTabId = state.tabs[0].id;
     persist();
@@ -947,6 +856,7 @@
       cancel.className = "btn btn-small btn-danger";
       cancel.textContent = "Cancel";
       cancel.addEventListener("click", () => {
+        stopAlertSound(t.id);
         tab.timers = tab.timers.filter((x) => x.id !== t.id);
         soundPlayedFor.delete(t.id);
         soundPlayedFor.delete(`${t.id}:rest`);
@@ -961,6 +871,7 @@
         reset.className = "btn btn-small btn-ghost";
         reset.textContent = "Reset";
         reset.addEventListener("click", () => {
+          stopAlertSound(t.id);
           t.state = "paused";
           t.pausedRemainingMs = t.durationSec * 1000;
           t.pausedRemainingSec = null;
@@ -981,7 +892,7 @@
         move.setAttribute("aria-label", "Done — move to just finished section");
         move.addEventListener("click", () => {
           if (timerNeedsPorkRest(t)) {
-            stopAlertSound();
+            stopAlertSound(t.id);
             t.state = "resting";
             t.endAt = Date.now() + PORK_REST_AFTER_DONE_SEC * 1000;
             soundPlayedFor.delete(`${t.id}:rest`);
@@ -1174,8 +1085,8 @@
       if (t.state === "done") validKeys.add(t.id);
       if (t.state === "rest_done") validKeys.add(`${t.id}:rest`);
     }));
-    pendingAlarms.forEach((key) => {
-      if (!validKeys.has(key)) pendingAlarms.delete(key);
+    pendingAlarms.forEach((attempt, key) => {
+      if (!validKeys.has(key)) stopAlarmKey(key);
     });
     void flushPendingAlarms();
 
@@ -1228,7 +1139,7 @@
       } catch {
         /* ignore */
       }
-      nextAlarmAttemptAt = 0;
+      pendingAlarms.forEach((attempt) => { attempt.retryAt = 0; });
       tick();
       renderWorkspace();
     }
