@@ -108,6 +108,21 @@
   let alarmAudioPrimed = false;
   let alarmFullWavUrl = null;
   let alarmAudioEl = null;
+  let audioPrimePromise = null;
+  let alarmAttempt = null;
+  let alarmGeneration = 0;
+  let nextAlarmAttemptAt = 0;
+  const pendingAlarms = new Set();
+
+  function withAudioTimeout(promise) {
+    let handle;
+    return Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        handle = setTimeout(() => reject(new Error("audio-timeout")), 1500);
+      }),
+    ]).finally(() => clearTimeout(handle));
+  }
 
   function setAscii(view, offset, str) {
     for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
@@ -200,34 +215,20 @@
     return el;
   }
 
-  function whenAlarmAudioReady(el) {
-    if (el.readyState >= 2) return Promise.resolve();
-    return new Promise((resolve, reject) => {
-      el.addEventListener("canplay", () => resolve(), { once: true });
-      el.addEventListener("error", () => reject(new Error("alarm-audio-load")), { once: true });
-    });
-  }
-
   function primeHtml5Alarm() {
-    if (alarmAudioPrimed) return;
-    void (async () => {
-      try {
-        const el = ensureAlarmAudioElement();
-        if (!el.src) el.src = getAlarmFullWavUrl();
-        await whenAlarmAudioReady(el);
+    if (alarmAudioPrimed || audioPrimePromise || alarmAttempt) return;
+    const el = ensureAlarmAudioElement();
+    // Call play synchronously inside the gesture, before any await.
+    el.volume = 0.02;
+    audioPrimePromise = withAudioTimeout(el.play())
+      .then(() => { alarmAudioPrimed = true; })
+      .catch(() => {})
+      .finally(() => {
         el.pause();
         el.currentTime = 0;
-        const prevVol = el.volume;
-        el.volume = 0.02;
-        await el.play();
-        el.pause();
-        el.currentTime = 0;
-        el.volume = prevVol > 0 ? prevVol : 1;
-        alarmAudioPrimed = true;
-      } catch {
-        /* ignore */
-      }
-    })();
+        el.volume = 1;
+        audioPrimePromise = null;
+      });
   }
 
   function unlockAudio() {
@@ -237,7 +238,7 @@
       if (!Ctx) return;
       if (!sharedAudioCtx) sharedAudioCtx = new Ctx();
       const ctx = sharedAudioCtx;
-      const p = ctx.state === "suspended" ? ctx.resume() : Promise.resolve();
+      const p = (ctx.state === "suspended" || ctx.state === "interrupted") ? ctx.resume() : Promise.resolve();
       p
         .then(() => {
           const osc = ctx.createOscillator();
@@ -260,6 +261,8 @@
     audioUnlockBound = true;
     const onUnlock = () => {
       unlockAudio();
+      nextAlarmAttemptAt = 0;
+      void flushPendingAlarms();
     };
     document.addEventListener("pointerdown", onUnlock, true);
     document.addEventListener("touchstart", onUnlock, true);
@@ -293,6 +296,9 @@
 
   /** Stops the mechanical alarm (e.g. when DONE is pressed). */
   function stopAlertSound() {
+    alarmGeneration++;
+    pendingAlarms.forEach((key) => soundPlayedFor.add(key));
+    pendingAlarms.clear();
     try {
       if (window.speechSynthesis) window.speechSynthesis.cancel();
     } catch {
@@ -320,19 +326,19 @@
     }
   }
 
-  async function playWebAudioAlarm() {
+  async function playWebAudioAlarm(generation) {
     const Ctx = window.AudioContext || window.webkitAudioContext;
-    if (!Ctx) return;
+    if (!Ctx) return false;
     if (!sharedAudioCtx) sharedAudioCtx = new Ctx();
     const ctx = sharedAudioCtx;
-    if (ctx.state === "suspended") {
+    if ((ctx.state === "suspended" || ctx.state === "interrupted")) {
       try {
-        await ctx.resume();
+        await withAudioTimeout(ctx.resume());
       } catch {
         return;
       }
     }
-    if (ctx.state !== "running") return;
+    if (ctx.state !== "running" || generation !== alarmGeneration) return false;
     const t0 = ctx.currentTime;
     const master = ctx.createGain();
     master.gain.setValueAtTime(0.52, t0);
@@ -394,30 +400,54 @@
       buzz.start(tBase);
       buzz.stop(tBase + totalTime + 0.04);
     }
+    return true;
   }
 
-  async function playMechanicalAlarm() {
+  async function playMechanicalAlarm(generation) {
     try {
       const el = ensureAlarmAudioElement();
-      await whenAlarmAudioReady(el);
-      el.pause();
       el.currentTime = 0;
-      await el.play();
-      return;
+      el.volume = 1;
+      await withAudioTimeout(el.play());
+      return generation === alarmGeneration;
     } catch {
-      /* Often happens if HTML5 audio was never primed by a user gesture. */
+      if (alarmAudioEl) alarmAudioEl.pause();
     }
+    if (generation !== alarmGeneration) return false;
     try {
-      await playWebAudioAlarm();
+      return await playWebAudioAlarm(generation);
     } catch {
-      /* ignore */
+      return false;
     }
   }
 
-  async function playAlertSound() {
-    stopAlertSound();
-    tryVibrateAlarm();
-    await playMechanicalAlarm();
+  function queueAlarm(key) {
+    if (!soundPlayedFor.has(key)) pendingAlarms.add(key);
+  }
+
+  async function flushPendingAlarms() {
+    if (alarmAttempt || !pendingAlarms.size || Date.now() < nextAlarmAttemptAt) return;
+    const generation = alarmGeneration;
+    const keys = [...pendingAlarms];
+    alarmAttempt = (async () => {
+      if (audioPrimePromise) await audioPrimePromise;
+      if (generation !== alarmGeneration) return;
+      tryVibrateAlarm();
+      const played = await playMechanicalAlarm(generation);
+      if (generation !== alarmGeneration) return;
+      if (played) {
+        keys.forEach((key) => {
+          soundPlayedFor.add(key);
+          pendingAlarms.delete(key);
+        });
+      }
+      nextAlarmAttemptAt = Date.now() + 2000;
+    })();
+    try {
+      await alarmAttempt;
+    } finally {
+      alarmAttempt = null;
+    }
   }
 
   function durationSecForDish(key) {
@@ -660,8 +690,7 @@
     t.state = "rest_done";
     t.endAt = null;
     if (!soundPlayedFor.has(`${t.id}:rest`)) {
-      soundPlayedFor.add(`${t.id}:rest`);
-      playAlertSound();
+      queueAlarm(`${t.id}:rest`);
     }
     persist();
   }
@@ -675,8 +704,7 @@
     t.pausedRemainingSec = 0;
     t.endAt = null;
     if (!soundPlayedFor.has(t.id)) {
-      soundPlayedFor.add(t.id);
-      playAlertSound();
+      queueAlarm(t.id);
     }
     persist();
   }
@@ -1132,15 +1160,24 @@
     const tab = activeTab();
     let needFullRender = false;
 
-    tab.timers.forEach((t) => {
-      if (t.state === "running") {
-        tryCompleteTimer(t);
-        if (t.state === "done") needFullRender = true;
-      } else if (t.state === "resting") {
-        tryCompleteRestTimer(t);
-        if (t.state === "rest_done") needFullRender = true;
-      }
+    // Complete timers in every workspace, including hidden stations.
+    state.tabs.forEach((station) => {
+      station.timers.forEach((t) => {
+        const previous = t.state;
+        if (t.state === "running") tryCompleteTimer(t);
+        else if (t.state === "resting") tryCompleteRestTimer(t);
+        if (station === tab && previous !== t.state) needFullRender = true;
+      });
     });
+    const validKeys = new Set();
+    state.tabs.forEach((station) => station.timers.forEach((t) => {
+      if (t.state === "done") validKeys.add(t.id);
+      if (t.state === "rest_done") validKeys.add(`${t.id}:rest`);
+    }));
+    pendingAlarms.forEach((key) => {
+      if (!validKeys.has(key)) pendingAlarms.delete(key);
+    });
+    void flushPendingAlarms();
 
     const now = Date.now();
     const jfBefore = tab.justFinished.length;
@@ -1185,12 +1222,14 @@
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") {
       try {
-        if (sharedAudioCtx && sharedAudioCtx.state === "suspended") {
+        if (sharedAudioCtx && (sharedAudioCtx.state === "suspended" || sharedAudioCtx.state === "interrupted")) {
           sharedAudioCtx.resume().catch(() => {});
         }
       } catch {
         /* ignore */
       }
+      nextAlarmAttemptAt = 0;
+      tick();
       renderWorkspace();
     }
   });
