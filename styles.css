@@ -831,3 +831,5 @@ body {
 @media (max-width: 359px) {
   #timer-list { grid-template-columns: minmax(0, 1fr); }
 }
+.audio-controls { margin-top: 1rem; }
+#audio-status { margin: 0.4rem 0 0; font-size: 0.875rem; color: var(--text-muted); }

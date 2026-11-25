@@ -10,7 +10,7 @@ function harness({blocked = false, suspended = false} = {}) {
   let rejectAudio = blocked;
   let resolveResume;
   const ctx = {
-    state: suspended ? 'interrupted' : 'running', sampleRate: 44100, destination: {},
+    get currentTime() { return Date.now() / 1000; }, state: suspended ? 'interrupted' : 'running', sampleRate: 44100, destination: {},
     resume() { return new Promise(resolve => { resolveResume = () => { ctx.state = 'running'; resolve(); }; }); },
     createBuffer(channels, count) { const data = new Float32Array(count); return { getChannelData: () => data }; },
     createBufferSource() {
@@ -21,9 +21,10 @@ function harness({blocked = false, suspended = false} = {}) {
   const c = {
     localStorage: {getItem: () => null, setItem() {}}, crypto: {randomUUID: () => 'station'},
     navigator: {}, window: { AudioContext: blocked ? undefined : function () { return ctx; } },
-    document: { createElement() {
-      const el = { setAttribute() {}, remove() {}, pause() { el.paused = true; }, play() {
-        el.played = true;
+    document: { getElementById: () => null, body: {appendChild() {}}, createElement() {
+      let position = 0, since = 0;
+      const el = { get currentTime() { return position + (since ? (Date.now()-since)/1000 : 0); }, set currentTime(v) {position=v; if(since) since=Date.now();}, paused: true, setAttribute() {}, remove() {}, pause() { position=el.currentTime; since=0; el.paused = true; }, play() {
+        el.played = true; el.paused=false; since=Date.now();
         return rejectAudio ? Promise.reject(new Error('NotAllowedError')) : Promise.resolve();
       }};
       html.push(el); return el;
@@ -31,11 +32,11 @@ function harness({blocked = false, suspended = false} = {}) {
     URL: {createObjectURL: () => 'blob:alarm'}, Blob, setTimeout, clearTimeout,
   };
   vm.createContext(c);
-  const cut = source.indexOf('  $("#btn-add-tab").addEventListener');
-  vm.runInContext(source.slice(0, cut) + 'globalThis.api = {queueAlarm, flushPendingAlarms, stopAlertSound, pendingAlarms, soundPlayedFor, tryCompleteTimer, tryCompleteRestTimer, tick, state, quiet: () => { renderWorkspace = () => {}; refreshTimerListDisplay = () => true; refreshJustFinishedDisplay = () => true; }};})();', c);
+  const cut = source.indexOf('  $("#btn-test-alarm").addEventListener');
+  vm.runInContext(source.slice(0, cut) + 'globalThis.api = {unlockMediaChannels, mediaChannels, queueAlarm, flushPendingAlarms, stopAlertSound, pendingAlarms, soundPlayedFor, tryCompleteTimer, tryCompleteRestTimer, tick, state, quiet: () => { renderWorkspace = () => {}; refreshTimerListDisplay = () => true; refreshJustFinishedDisplay = () => true; }};})();', c);
   return {api:c.api, voices, html, ctx, resume: () => resolveResume(), allow: () => { rejectAudio = false; }};
 }
-const settle = () => new Promise(setImmediate);
+const settle = () => new Promise(resolve => setTimeout(resolve, 250));
 test('simultaneous dishes start separate non-silent audio sources immediately', async () => {
   const h = harness();
   h.api.queueAlarm('a'); h.api.queueAlarm('b'); h.api.queueAlarm('c');
@@ -81,4 +82,21 @@ test('expired dishes in different workspaces and pork resting each sound', async
   assert.equal(a.state,'done'); assert.equal(b.state,'done'); assert.equal(rest.state,'rest_done');
   h.api.tick(); await settle();
   assert.equal(h.voices.length,3, 'ticks must not duplicate successful alerts');
+});
+
+test('Safari channels are unlocked during gesture and reused independently on expiry', async () => {
+  const h = harness(); h.api.unlockMediaChannels(); await settle();
+  assert.equal(h.api.mediaChannels.filter(c => c.unlocked).length,12);
+  h.api.queueAlarm('media-a'); h.api.queueAlarm('media-b'); await settle();
+  assert.equal(h.voices.length,0, 'primed media should be the primary path');
+  assert.equal(h.api.mediaChannels.filter(c => c.busy).length,2);
+  assert.equal(h.api.soundPlayedFor.size,2);
+  h.api.stopAlertSound('media-a');
+  assert.equal(h.api.mediaChannels.filter(c => c.busy).length,1);
+});
+test('reload recovers pending done alarms', async () => {
+  const h = harness(); h.api.quiet();
+  h.api.state.tabs[0].timers.push({id:'saved-done',state:'done'});
+  h.api.tick(); await settle();
+  assert(h.api.soundPlayedFor.has('saved-done'));
 });

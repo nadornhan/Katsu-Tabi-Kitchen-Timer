@@ -108,6 +108,84 @@
   const pendingAlarms = new Map();
   const alarmVoices = new Map();
 
+  const mediaChannels = [];
+
+  function audioStatus(message) {
+    const el = document.getElementById("audio-status");
+    if (el) el.textContent = message;
+  }
+
+  function prepareMediaChannels() {
+    if (mediaChannels.length) return;
+    for (let i = 0; i < 12; i++) {
+      const el = document.createElement("audio");
+      el.src = "assets/alarm.wav?v=2";
+      el.preload = "auto";
+      el.setAttribute("playsinline", "");
+      el.hidden = true;
+      document.body.appendChild(el);
+      mediaChannels.push({el, busy: false, priming: false, unlocked: false});
+    }
+  }
+
+  function unlockMediaChannels() {
+    prepareMediaChannels();
+    mediaChannels.forEach((channel) => {
+      if (channel.busy || channel.priming || channel.unlocked) return;
+      channel.priming = true;
+      channel.el.muted = false;
+      channel.el.volume = 0;
+      // No await before play: Safari must see this call inside the tap.
+      try {
+        withAudioTimeout(channel.el.play()).then(() => {
+          channel.unlocked = true;
+        }).catch(() => {}).finally(() => {
+          channel.el.pause();
+          channel.el.currentTime = 0;
+          channel.el.volume = 1;
+          channel.priming = false;
+        });
+      } catch {
+        channel.priming = false;
+        channel.el.volume = 1;
+      }
+    });
+  }
+
+  async function playMediaAlarm(key, attempt) {
+    const channel = mediaChannels.find(c => c.unlocked && !c.busy && !c.priming);
+    if (!channel) return false;
+    channel.busy = true;
+    const el = channel.el;
+    const voice = { stop: () => {
+      el.pause(); el.currentTime = 0; channel.busy = false;
+    }};
+    alarmVoices.set(key, voice);
+    el.onended = () => {
+      channel.busy = false;
+      if (alarmVoices.get(key) === voice) alarmVoices.delete(key);
+    };
+    try {
+      el.currentTime = 0;
+      el.muted = false;
+      el.volume = 1;
+      await withAudioTimeout(el.play());
+      if (attempt.cancelled) { voice.stop(); return false; }
+      // A resolved play() alone is not evidence that playback advances.
+      const start = el.currentTime;
+      await new Promise(resolve => setTimeout(resolve, 180));
+      if (attempt.cancelled) { voice.stop(); return false; }
+      if (el.paused || el.currentTime <= start) throw new Error("audio-stalled");
+      audioStatus("Alarm playing. If silent, check iPhone media volume and audio output.");
+      return true;
+    } catch {
+      voice.stop();
+      channel.unlocked = false;
+      if (alarmVoices.get(key) === voice) alarmVoices.delete(key);
+      return false;
+    }
+  }
+
   function withAudioTimeout(promise) {
     let handle;
     return Promise.race([
@@ -221,6 +299,7 @@
   }
 
   function unlockAudio() {
+    unlockMediaChannels();
     try {
       // Ask iOS for media playback routing when supported.
       if (navigator.audioSession) navigator.audioSession.type = "playback";
@@ -275,6 +354,10 @@
   }
 
   async function playAlarm(key, attempt) {
+    if (mediaChannels.some(c => c.unlocked && !c.busy && !c.priming)) {
+      if (await playMediaAlarm(key, attempt)) return true;
+      if (attempt.cancelled) return false;
+    }
     try {
       const ctx = getAudioContext();
       if (ctx) {
@@ -291,6 +374,14 @@
           };
           alarmVoices.set(key, voice);
           source.start();
+          const startedAt = ctx.currentTime;
+          await new Promise(resolve => setTimeout(resolve, 180));
+          if (attempt.cancelled) { voice.stop(); return false; }
+          if (ctx.state !== "running" || ctx.currentTime <= startedAt) {
+            voice.stop();
+            if (alarmVoices.get(key) === voice) alarmVoices.delete(key);
+            throw new Error("audio-context-stalled");
+          }
           return true;
         }
       }
@@ -336,6 +427,7 @@
           pendingAlarms.delete(key);
         } else {
           attempt.retryAt = Date.now() + 1000;
+          audioStatus("Sound blocked or interrupted. Tap Test alarm to enable sound again.");
         }
       }).catch(() => {
         attempt.retryAt = Date.now() + 1000;
@@ -1082,8 +1174,8 @@
     });
     const validKeys = new Set();
     state.tabs.forEach((station) => station.timers.forEach((t) => {
-      if (t.state === "done") validKeys.add(t.id);
-      if (t.state === "rest_done") validKeys.add(`${t.id}:rest`);
+      if (t.state === "done") { validKeys.add(t.id); queueAlarm(t.id); }
+      if (t.state === "rest_done") { validKeys.add(`${t.id}:rest`); queueAlarm(`${t.id}:rest`); }
     }));
     pendingAlarms.forEach((attempt, key) => {
       if (!validKeys.has(key)) stopAlarmKey(key);
@@ -1119,6 +1211,13 @@
     buildDishPicker();
     buildQuantityPicker();
   }
+
+  $("#btn-test-alarm").addEventListener("click", () => {
+    unlockAudio();
+    audioStatus("Testing in 3 seconds. Keep this page open and listen for the bell.");
+    addTimer("Sound test", 1, 3, null);
+  });
+  prepareMediaChannels();
 
   $("#btn-add-tab").addEventListener("click", () => {
     const name = window.prompt("Workspace name (e.g. your name):", "Station");
